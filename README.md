@@ -89,6 +89,184 @@ ctr run --snapshotter clone \
     sh -c "cat /data.txt"   # prints: hello from source
 ```
 
+## Kubernetes
+
+The snapshotter can be used directly with Kubernetes by configuring
+containerd's CRI plugin to use it as the default snapshotter.  Regular pods
+require no changes; the clone feature is available to any workload that can
+reach the containerd socket.
+
+### Deploy the snapshotter on every node
+
+A ready-to-use DaemonSet manifest is provided in [`deploy/daemonset.yaml`](deploy/daemonset.yaml).
+It mounts the host paths for the Unix socket and snapshot data so that
+containerd can connect to the process:
+
+```sh
+kubectl apply -f deploy/daemonset.yaml
+```
+
+### Configure containerd on each node
+
+Add both the `proxy_plugins` entry and the CRI `snapshotter` setting to
+`/etc/containerd/config.toml`, then restart containerd:
+
+```toml
+[proxy_plugins]
+  [proxy_plugins.clone]
+    type    = "snapshot"
+    address = "/run/containerd-clone-snapshotter/containerd-clone-snapshotter.sock"
+
+[plugins."io.containerd.grpc.v1.cri"]
+  snapshotter = "clone"
+```
+
+> **Note:** Changing the default snapshotter affects all new pods.  Existing
+> pods are unaffected until they are recreated.  You may need to pull images
+> again after switching snapshotters so that their layers are stored under the
+> new snapshotter.
+
+### Pod examples
+
+Ready-to-use pod manifests are provided in the `deploy/` directory.
+
+#### Source pod
+
+[`deploy/pod-source.yaml`](deploy/pod-source.yaml) runs a regular Alpine
+container that writes a file and keeps sleeping.  No special annotations or
+settings are required; the clone snapshotter is completely transparent to
+workloads once containerd is configured.
+
+```sh
+kubectl apply -f deploy/pod-source.yaml
+kubectl wait --for=condition=Ready pod/source-pod
+```
+
+#### Clone-trigger pod
+
+[`deploy/pod-clone-trigger.yaml`](deploy/pod-clone-trigger.yaml) uses a
+privileged init container that mounts the containerd socket and calls `ctr` to
+prepare a clone snapshot of the source pod.
+
+Before applying, find the node where `source-pod` is running and replace
+`<node-name>` in the manifest:
+
+```sh
+NODE=$(kubectl get pod source-pod -o jsonpath='{.spec.nodeName}')
+sed "s/<node-name>/${NODE}/" deploy/pod-clone-trigger.yaml | kubectl apply -f -
+```
+
+After the init container completes, verify the snapshot was prepared:
+
+```sh
+# On the node (or via kubectl debug / kubectl exec into the init container):
+ctr -n k8s.io snapshots ls | grep cloned-from-source-pod
+```
+
+### Trigger the clone feature manually
+
+Kubernetes itself does not expose snapshot labels through the pod API, but any
+process with access to the containerd socket (e.g., a privileged init
+container or a custom controller) can prepare a clone snapshot directly via
+the containerd client or `ctr`:
+
+```sh
+# Inside a privileged pod on the same node as the source container:
+ctr -n k8s.io snapshots --snapshotter clone prepare \
+    --label containerd.io/snapshot/clone-source=<source-container-id> \
+    <new-snapshot-key> ""
+```
+
+The containerd namespace used by Kubernetes is `k8s.io`; the snapshotter
+handles this automatically via the gRPC metadata forwarded by containerd.
+
+## Testing with minikube
+
+[`hack/minikube-test.sh`](hack/minikube-test.sh) provides a fully-automated
+end-to-end test that:
+
+1. Starts a disposable minikube cluster with the **containerd** runtime.
+2. Cross-compiles the snapshotter binary for `linux/amd64` and copies it into
+   the minikube node.
+3. Installs a systemd unit for the snapshotter and patches containerd's
+   `config.toml` with the `proxy_plugins.clone` stanza.
+4. Restarts containerd so it picks up the proxy plugin.
+5. Deploys `deploy/pod-source.yaml` and waits for it to become Ready.
+6. Calls `ctr -n k8s.io snapshots prepare` with the clone-source label to
+   create a clone snapshot of the source pod.
+7. Verifies the clone snapshot appears in the containerd snapshot list.
+
+### Prerequisites
+
+| Tool | Minimum version | Install |
+|------|-----------------|---------|
+| [minikube](https://minikube.sigs.k8s.io/docs/start/) | 1.32 | `brew install minikube` |
+| [kubectl](https://kubernetes.io/docs/tasks/tools/) | any | `brew install kubectl` |
+| [go](https://go.dev/doc/install) | 1.21 | <https://go.dev/dl/> |
+| [docker](https://docs.docker.com/get-docker/) | 20+ | used as the minikube driver |
+
+### Run
+
+```sh
+# Basic run — cluster is deleted after the test completes.
+bash hack/minikube-test.sh
+
+# Keep the cluster running after the test (useful for inspecting state).
+KEEP_CLUSTER=1 bash hack/minikube-test.sh
+
+# Use a custom minikube profile name.
+MINIKUBE_PROFILE=my-clone-test KEEP_CLUSTER=1 bash hack/minikube-test.sh
+```
+
+Expected output (abridged):
+
+```
+[INFO]  Checking prerequisites...
+[OK]    All prerequisites satisfied.
+[INFO]  Starting minikube profile 'clone-snapshotter-test' (driver=docker, runtime=containerd)...
+[OK]    minikube is running.
+[INFO]  Building containerd-clone-snapshotter for linux/amd64...
+[OK]    Binary built.
+...
+[OK]    Clone snapshot found: cloned-test-snapshot   Committed ...
+══════════════════════════════════════════════════════
+  containerd-clone-snapshotter minikube test: PASSED
+══════════════════════════════════════════════════════
+```
+
+### Environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MINIKUBE_PROFILE` | `clone-snapshotter-test` | minikube profile name |
+| `KEEP_CLUSTER` | `0` | Set to `1` to leave the cluster running |
+| `DRIVER` | `docker` | minikube driver (`docker`, `virtualbox`, …) |
+
+### How the containerd config is patched
+
+The script appends the following stanza to `/etc/containerd/config.toml`
+**inside the minikube VM** (idempotent — added only once):
+
+```toml
+[proxy_plugins]
+  [proxy_plugins.clone]
+    type    = "snapshot"
+    address = "/run/containerd-clone-snapshotter/containerd-clone-snapshotter.sock"
+```
+
+To inspect state after a `KEEP_CLUSTER=1` run:
+
+```sh
+# SSH into the node.
+minikube ssh -p clone-snapshotter-test
+
+# Check snapshotter logs.
+sudo journalctl -u containerd-clone-snapshotter -f
+
+# List all snapshots in the k8s.io namespace.
+sudo ctr -n k8s.io snapshots ls
+```
+
 ## Architecture
 
 ```
@@ -104,6 +282,11 @@ overlayfs snapshotter  (github.com/containerd/containerd/snapshots/overlay)
 The `snapshotter.CloneSnapshotter` type in package `snapshotter` is a thin
 wrapper around **any** `snapshots.Snapshotter`.  It intercepts only `Prepare`
 calls that carry the clone label; all other calls are forwarded unchanged.
+
+The gRPC server includes a unary interceptor that propagates the containerd
+namespace from the incoming gRPC metadata into the request context.  This
+ensures that the `k8s.io` namespace used by containerd's CRI plugin (and any
+other namespace) is correctly visible to the inner overlayfs snapshotter.
 
 ## Development
 

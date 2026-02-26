@@ -1,0 +1,62 @@
+# DaemonSet that runs containerd-clone-snapshotter on every node.
+#
+# The binary is expected to be pre-installed on each host at
+# /usr/local/bin/containerd-clone-snapshotter, or you can replace the
+# hostPath volume with an init-container that copies a versioned image.
+#
+# After deploying, add the following to /etc/containerd/config.toml on each
+# node and restart containerd:
+#
+#   [proxy_plugins]
+#     [proxy_plugins.clone]
+#       type    = "snapshot"
+#       address = "/run/containerd-clone-snapshotter/containerd-clone-snapshotter.sock"
+#
+#   [plugins."io.containerd.grpc.v1.cri"]
+#     snapshotter = "clone"
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: containerd-clone-snapshotter
+  namespace: kube-system
+  labels:
+    app: containerd-clone-snapshotter
+spec:
+  selector:
+    matchLabels:
+      app: containerd-clone-snapshotter
+  template:
+    metadata:
+      labels:
+        app: containerd-clone-snapshotter
+    spec:
+      hostPID: true
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: containerd-clone-snapshotter
+          # Pin to a specific release tag in production, e.g. v1.0.0.
+          image: ghcr.io/fengqi-dev/containerd-clone-snapshotter:v0.1.0
+          securityContext:
+            # SYS_ADMIN is required for overlay xattr operations.
+            # CHOWN / DAC_OVERRIDE / FOWNER allow the snapshotter to preserve
+            # file ownership and permissions when copying writable layers.
+            capabilities:
+              add: ["SYS_ADMIN", "CHOWN", "DAC_OVERRIDE", "FOWNER"]
+          args:
+            - -socket=/run/containerd-clone-snapshotter/containerd-clone-snapshotter.sock
+            - -root=/var/lib/containerd-clone-snapshotter
+          volumeMounts:
+            - name: run
+              mountPath: /run/containerd-clone-snapshotter
+            - name: data
+              mountPath: /var/lib/containerd-clone-snapshotter
+      volumes:
+        - name: run
+          hostPath:
+            path: /run/containerd-clone-snapshotter
+            type: DirectoryOrCreate
+        - name: data
+          hostPath:
+            path: /var/lib/containerd-clone-snapshotter
+            type: DirectoryOrCreate

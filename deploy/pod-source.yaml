@@ -1,0 +1,30 @@
+# Source pod — the pod whose filesystem state you want to clone.
+#
+# This is a regular pod; no special annotations or settings are required.
+# The clone snapshotter is transparent to pod workloads once containerd has
+# been configured to use it (see README.md § Kubernetes).
+#
+# The pod writes a file to disk that will be visible in any clone of this
+# pod's container filesystem.
+#
+# Usage:
+#   kubectl apply -f deploy/pod-source.yaml
+#   kubectl wait --for=condition=Ready pod/source-pod
+apiVersion: v1
+kind: Pod
+metadata:
+  name: source-pod
+  namespace: default
+spec:
+  containers:
+    - name: source
+      image: alpine:3.19
+      # Write a file and then keep the container running so the snapshot
+      # remains active and can be cloned.
+      command:
+        - sh
+        - -c
+        - |
+          echo "hello from source-pod" > /data.txt
+          echo "snapshot written, sleeping..."
+          sleep infinity

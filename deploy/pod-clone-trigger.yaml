@@ -1,0 +1,137 @@
+# Clone-trigger pod — prepares a clone snapshot of source-pod and then
+# starts a container from that cloned filesystem.
+#
+# How it works
+# ────────────
+# 1. An init container runs with access to the containerd socket.  It calls
+#    `ctr -n k8s.io snapshots prepare` with the clone-source label pointing
+#    at source-pod's active container snapshot.
+# 2. The init container writes the new snapshot key to a shared emptyDir so
+#    that operators / subsequent steps can refer to it.
+# 3. The main container starts normally and has access to the cloned data
+#    through the pod's own (independently-created) container snapshot.
+#
+# IMPORTANT: The init container only *prepares* the clone snapshot inside
+# containerd's state.  The main container's own snapshot is still created
+# by containerd/CRI via the normal image-pull path; the cloned snapshot is
+# made available as a standalone containerd snapshot that you can inspect
+# with `ctr -n k8s.io snapshots ls`.  To have the main container *start
+# from* the cloned snapshot you would need a custom admission controller or
+# a CRI-aware tool — this manifest demonstrates the clone-trigger pattern.
+#
+# Prerequisites
+# ─────────────
+# • The node must have `ctr` available at /usr/local/bin/ctr, or replace the
+#   init container image with one that ships `ctr`
+#   (e.g. docker.io/containerd/containerd:1.7.30).
+# • Both pods must be on the same node (use nodeName or nodeSelector).
+# • The containerd `clone` snapshotter must be configured (see README.md).
+#
+# Usage
+# ─────
+# 1. Deploy source-pod first and wait for it to be Running:
+#      kubectl apply -f deploy/pod-source.yaml
+#      kubectl wait --for=condition=Ready pod/source-pod
+#
+# 2. Find the source pod's node and its containerd container ID:
+#      NODE=$(kubectl get pod source-pod -o jsonpath='{.spec.nodeName}')
+#      # On the node: ctr -n k8s.io containers ls | grep source-pod
+#
+# 3. Set SOURCE_CONTAINER_ID in the init container command below, then apply:
+#      kubectl apply -f deploy/pod-clone-trigger.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: clone-trigger-pod
+  namespace: default
+spec:
+  # Schedule on the same node as source-pod so the snapshots are accessible.
+  # Replace <node-name> with the value of:
+  #   kubectl get pod source-pod -o jsonpath='{.spec.nodeName}'
+  nodeName: <node-name>
+
+  initContainers:
+    - name: prepare-clone
+      # Use an image that ships `ctr`, or install it via apk / apt.
+      # The containerd/containerd image bundles `ctr` at /usr/local/bin/ctr.
+      image: docker.io/containerd/containerd:1.7.30
+      command:
+        - sh
+        - -c
+        - |
+          set -e
+
+          # ── Find the active snapshot key for source-pod's container ────────
+          # In the k8s.io namespace the snapshot key equals the container ID.
+          # Filter by the pod name label that CRI attaches to every container.
+          SOURCE_CONTAINER_ID=$(
+            ctr -n k8s.io containers ls \
+              'labels."io.kubernetes.pod.name"==source-pod' \
+              -q | head -1
+          )
+
+          if [ -z "${SOURCE_CONTAINER_ID}" ]; then
+            echo "ERROR: source-pod container not found in k8s.io namespace" >&2
+            exit 1
+          fi
+
+          CLONE_KEY="cloned-from-source-pod"
+
+          echo "Cloning snapshot from container: ${SOURCE_CONTAINER_ID}"
+
+          # ── Prepare the clone snapshot ─────────────────────────────────────
+          ctr -n k8s.io snapshots \
+            --snapshotter clone \
+            prepare \
+            --label containerd.io/snapshot/clone-source="${SOURCE_CONTAINER_ID}" \
+            "${CLONE_KEY}" ""
+
+          echo "Clone snapshot '${CLONE_KEY}' prepared successfully."
+
+          # Persist the snapshot key for any subsequent steps.
+          echo "${CLONE_KEY}" > /shared/clone-snapshot-key
+
+      securityContext:
+        # Needs access to the containerd socket (Unix socket) and the
+        # overlay filesystem directories on the host.
+        privileged: true
+      volumeMounts:
+        - name: containerd-socket
+          mountPath: /run/containerd/containerd.sock
+        - name: shared
+          mountPath: /shared
+
+  containers:
+    - name: cloned
+      image: alpine:3.19
+      command:
+        - sh
+        - -c
+        - |
+          # The cloned snapshot has been prepared in containerd's state.
+          # The key is stored in /shared/clone-snapshot-key by the init
+          # container and can be used by operators or custom controllers.
+          echo "Clone snapshot key: $(cat /shared/clone-snapshot-key)"
+
+          # This container itself runs from the standard alpine image layers.
+          # To actually start a container from the cloned snapshot you need
+          # to pass the snapshot key through a CRI-aware mechanism (e.g., a
+          # custom controller that creates a sandbox with the specific
+          # snapshot key).
+          echo "Running in cloned context."
+          sleep infinity
+
+      volumeMounts:
+        - name: shared
+          mountPath: /shared
+
+  volumes:
+    # The containerd Unix socket — required by ctr in the init container.
+    - name: containerd-socket
+      hostPath:
+        path: /run/containerd/containerd.sock
+        type: Socket
+    # Shared in-memory volume for passing data between init and main containers.
+    - name: shared
+      emptyDir:
+        medium: Memory
