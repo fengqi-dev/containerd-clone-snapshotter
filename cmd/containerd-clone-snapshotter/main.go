@@ -33,6 +33,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log"
 	"net"
@@ -43,10 +44,26 @@ import (
 
 	snapshotsapi "github.com/containerd/containerd/api/services/snapshots/v1"
 	"github.com/containerd/containerd/contrib/snapshotservice"
+	"github.com/containerd/containerd/namespaces"
 	"github.com/containerd/containerd/snapshots/overlay"
 	"github.com/fengqi-dev/containerd-clone-snapshotter/snapshotter"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 )
+
+// namespaceUnaryInterceptor extracts the containerd namespace from incoming
+// gRPC metadata and attaches it to the request context.  containerd's CRI
+// plugin sets the "containerd-namespace" metadata header (typically "k8s.io")
+// on every call; without this interceptor the inner snapshotter would receive
+// a context with no namespace, which can cause unexpected behaviour.
+func namespaceUnaryInterceptor(ctx context.Context, req interface{}, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+	if md, ok := metadata.FromIncomingContext(ctx); ok {
+		if vals := md[namespaces.GRPCHeader]; len(vals) > 0 {
+			ctx = namespaces.WithNamespace(ctx, vals[0])
+		}
+	}
+	return handler(ctx, req)
+}
 
 func main() {
 	socketPath := flag.String(
@@ -95,7 +112,7 @@ func main() {
 	}
 
 	// Register the service and start serving.
-	grpcServer := grpc.NewServer()
+	grpcServer := grpc.NewServer(grpc.UnaryInterceptor(namespaceUnaryInterceptor))
 	snapshotsapi.RegisterSnapshotsServer(grpcServer, service)
 
 	// Graceful shutdown on SIGINT / SIGTERM.
