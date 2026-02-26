@@ -126,7 +126,44 @@ Add both the `proxy_plugins` entry and the CRI `snapshotter` setting to
 > again after switching snapshotters so that their layers are stored under the
 > new snapshotter.
 
-### Trigger the clone feature from a Kubernetes workload
+### Pod examples
+
+Ready-to-use pod manifests are provided in the `deploy/` directory.
+
+#### Source pod
+
+[`deploy/pod-source.yaml`](deploy/pod-source.yaml) runs a regular Alpine
+container that writes a file and keeps sleeping.  No special annotations or
+settings are required; the clone snapshotter is completely transparent to
+workloads once containerd is configured.
+
+```sh
+kubectl apply -f deploy/pod-source.yaml
+kubectl wait --for=condition=Ready pod/source-pod
+```
+
+#### Clone-trigger pod
+
+[`deploy/pod-clone-trigger.yaml`](deploy/pod-clone-trigger.yaml) uses a
+privileged init container that mounts the containerd socket and calls `ctr` to
+prepare a clone snapshot of the source pod.
+
+Before applying, find the node where `source-pod` is running and replace
+`<node-name>` in the manifest:
+
+```sh
+NODE=$(kubectl get pod source-pod -o jsonpath='{.spec.nodeName}')
+sed "s/<node-name>/${NODE}/" deploy/pod-clone-trigger.yaml | kubectl apply -f -
+```
+
+After the init container completes, verify the snapshot was prepared:
+
+```sh
+# On the node (or via kubectl debug / kubectl exec into the init container):
+ctr -n k8s.io snapshots ls | grep cloned-from-source-pod
+```
+
+### Trigger the clone feature manually
 
 Kubernetes itself does not expose snapshot labels through the pod API, but any
 process with access to the containerd socket (e.g., a privileged init
